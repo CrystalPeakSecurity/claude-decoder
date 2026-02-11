@@ -54,108 +54,85 @@ USAGE
 
 Example:
 
-    from models import Entry, Read, Write, Edit
-    import json
-    
-    def parse_session(path: str) -> list[Read | Write | Edit | ...]:
-        entries = []
-        with open(path) as f:
-            for line in f:
-                data = json.loads(line)
-                if data.get("type") == "progress":
-                    continue  # Skip bloated progress entries
-                entries.append(Entry.from_dict(data))
-        
-        # Build tool_use_id -> result content map
-        results: dict[str, str] = {}
-        for entry in entries:
-            if entry.type == "user" and entry.message:
-                for block in entry.message.content:
-                    if isinstance(block, ToolResultBlock):
-                        results[block.tool_use_id] = block.content
-        
-        # Extract file operations
-        operations = []
-        for entry in entries:
-            if entry.type == "assistant" and entry.message:
-                for block in entry.message.content:
-                    if isinstance(block, ToolUseBlock):
-                        result_content = results.get(block.id, "")
-                        op = make_file_operation(block, result_content, entry.timestamp)
-                        if op:
-                            operations.append(op)
-        
-        return operations
+    from models import parse_entries, extract_operations
+
+    # Get all entries (for conversation rendering, metadata, etc.)
+    entries = parse_entries("session.jsonl")
+
+    # Get file operations only (for reconstruction)
+    operations = extract_operations("session.jsonl")
 """
 
-from dataclasses import dataclass, field
+import json
+import shlex
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import ClassVar
 
 
 # =============================================================================
 # CONTENT BLOCKS (inside message.content list)
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class TextBlock:
     """Plain text content from Claude or user."""
-    type: str  # "text"
+    type: ClassVar[str] = "text"
     text: str
-    
+
     @classmethod
     def from_dict(cls, d: dict) -> "TextBlock":
-        return cls(type=d["type"], text=d.get("text", ""))
+        return cls(text=d.get("text", ""))
 
 
-@dataclass
+@dataclass(frozen=True)
 class ThinkingBlock:
     """Claude's internal reasoning (extended thinking mode)."""
-    type: str  # "thinking"
+    type: ClassVar[str] = "thinking"
     thinking: str
-    
+
     @classmethod
     def from_dict(cls, d: dict) -> "ThinkingBlock":
-        return cls(type=d["type"], thinking=d.get("thinking", ""))
+        return cls(thinking=d.get("thinking", ""))
 
 
-@dataclass
+@dataclass(frozen=True)
 class ImageBlock:
     """Image content (screenshots, pasted images)."""
-    type: str  # "image"
+    type: ClassVar[str] = "image"
     source: dict  # {"type": "base64", "media_type": "image/png", "data": "..."}
-    
+
     @classmethod
     def from_dict(cls, d: dict) -> "ImageBlock":
-        return cls(type=d["type"], source=d.get("source", {}))
+        return cls(source=d.get("source", {}))
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolUseBlock:
     """Tool invocation by Claude."""
-    type: str  # "tool_use"
+    type: ClassVar[str] = "tool_use"
     id: str  # e.g. "toolu_01ABC..."
     name: str  # e.g. "Read", "Write", "Edit", "Bash"
     input: dict  # Tool-specific input parameters
-    
+
     @classmethod
     def from_dict(cls, d: dict) -> "ToolUseBlock":
         return cls(
-            type=d["type"],
             id=d["id"],
             name=d.get("name", ""),
             input=d.get("input", {}),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolResultBlock:
     """Result of a tool execution."""
-    type: str  # "tool_result"
+    type: ClassVar[str] = "tool_result"
     tool_use_id: str  # Links back to ToolUseBlock.id
-    content: str | list  # Result content (often string, sometimes list of blocks)
+    content: str  # Result content (normalized to string by from_dict)
     is_error: bool = False
-    
+
     @classmethod
     def from_dict(cls, d: dict) -> "ToolResultBlock":
         content = d.get("content", "")
@@ -170,7 +147,6 @@ class ToolResultBlock:
                     parts.append(item)
             content = "\n".join(parts) if parts else str(d.get("content", ""))
         return cls(
-            type=d["type"],
             tool_use_id=d.get("tool_use_id", ""),
             content=content,
             is_error=d.get("is_error", False),
@@ -195,14 +171,14 @@ def parse_content_block(d: dict) -> ContentBlock:
         return ToolResultBlock.from_dict(d)
     else:
         # Unknown block type - return as text with raw content
-        return TextBlock(type=block_type, text=str(d))
+        return TextBlock(text=str(d))
 
 
 # =============================================================================
 # MESSAGE (the message field of an Entry)
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class TokenUsage:
     """Token consumption for a message."""
     input_tokens: int = 0
@@ -222,11 +198,11 @@ class TokenUsage:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class Message:
     """A conversation message (user or assistant)."""
     role: str  # "user" or "assistant"
-    content: list[ContentBlock]
+    content: tuple[ContentBlock, ...]
     model: str | None = None
     stop_reason: str | None = None
     usage: TokenUsage | None = None
@@ -236,9 +212,9 @@ class Message:
         raw_content = d.get("content", [])
         if isinstance(raw_content, str):
             # Sometimes content is just a string
-            content = [TextBlock(type="text", text=raw_content)]
+            content = (TextBlock(text=raw_content),)
         else:
-            content = [parse_content_block(block) for block in raw_content]
+            content = tuple(parse_content_block(block) for block in raw_content)
         
         usage = None
         if "usage" in d:
@@ -257,7 +233,7 @@ class Message:
 # ENTRY (a single line in the JSONL)
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class Entry:
     """
     A single entry (line) in the Claude Code JSONL log.
@@ -273,7 +249,7 @@ class Entry:
     """
     type: str
     uuid: str
-    timestamp: datetime
+    timestamp: datetime | None
     session_id: str = ""
     parent_uuid: str | None = None
     parent_tool_use_id: str | None = None  # Present for sub-agent messages
@@ -282,23 +258,56 @@ class Entry:
     version: str | None = None
     git_branch: str | None = None
     subtype: str | None = None  # For system/result entries
-    
+    # file-history-snapshot fields
+    snapshot: dict | None = None  # trackedFileBackups: filename -> {backupFileName, version, backupTime}
+    # summary fields
+    summary_text: str | None = None
+    # queue-operation fields
+    operation: str | None = None  # "enqueue" or "dequeue"
+    queue_content: str | None = None
+    # system fields
+    duration_ms: int | None = None
+
     @classmethod
     def from_dict(cls, d: dict) -> "Entry":
         message = None
         if "message" in d and d["message"]:
             message = Message.from_dict(d["message"])
-        
+
+        entry_type = d.get("type", "")
+
+        # Parse timestamp — try top-level first, then type-specific locations
         timestamp_str = d.get("timestamp", "")
-        try:
-            # Handle ISO format with or without timezone
-            timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            timestamp = datetime.now()
-        
+        if not timestamp_str and entry_type == "file-history-snapshot":
+            timestamp_str = d.get("snapshot", {}).get("timestamp", "")
+        timestamp: datetime | None = None
+        if timestamp_str:
+            try:
+                timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                pass
+
+        # Type-specific fields
+        snapshot = None
+        summary_text = None
+        operation = None
+        queue_content = None
+        duration_ms = None
+
+        if entry_type == "file-history-snapshot":
+            snap = d.get("snapshot", {})
+            snapshot = snap.get("trackedFileBackups", {})
+        elif entry_type == "summary":
+            summary_text = d.get("summary")
+        elif entry_type == "queue-operation":
+            operation = d.get("operation")
+            queue_content = d.get("content")
+        elif entry_type == "system":
+            duration_ms = d.get("durationMs")
+
         return cls(
-            type=d.get("type", ""),
-            uuid=d.get("uuid", ""),
+            type=entry_type,
+            uuid=d.get("uuid", "") or d.get("messageId", ""),
             timestamp=timestamp,
             session_id=d.get("session_id", d.get("sessionId", "")),
             parent_uuid=d.get("parent_uuid", d.get("parentUuid")),
@@ -308,6 +317,11 @@ class Entry:
             version=d.get("version"),
             git_branch=d.get("git_branch", d.get("gitBranch")),
             subtype=d.get("subtype"),
+            snapshot=snapshot,
+            summary_text=summary_text,
+            operation=operation,
+            queue_content=queue_content,
+            duration_ms=duration_ms,
         )
 
 
@@ -315,7 +329,7 @@ class Entry:
 # UNIFIED FILE OPERATIONS (joined tool_use + tool_result)
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class Read:
     """
     A file read operation.
@@ -337,7 +351,7 @@ class Read:
     is_error: bool = False     # True if the read failed
 
 
-@dataclass
+@dataclass(frozen=True)
 class Write:
     """
     A file write operation (full file replacement).
@@ -352,9 +366,10 @@ class Write:
     content: str
     timestamp: datetime
     tool_use_id: str = ""
+    is_error: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class Edit:
     """
     A single string replacement edit.
@@ -373,22 +388,7 @@ class Edit:
     replace_all: bool = False
 
 
-@dataclass
-class MultiEdit:
-    """
-    Multiple edits to a single file in one operation.
-    
-    Created from: tool_use(name="MultiEdit")
-    - file_path: from tool_use.input.file_path
-    - edits: list of (old_string, new_string) tuples from tool_use.input.edits
-    """
-    file_path: str
-    edits: list[tuple[str, str]]  # [(old_str, new_str), ...]
-    timestamp: datetime
-    tool_use_id: str = ""
-
-
-@dataclass
+@dataclass(frozen=True)
 class BashCommand:
     """
     A bash command execution.
@@ -407,7 +407,7 @@ class BashCommand:
     timeout: int | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class NotebookEdit:
     """
     Jupyter notebook cell edit.
@@ -421,7 +421,21 @@ class NotebookEdit:
     tool_use_id: str = ""
 
 
-FileOperation = Read | Write | Edit | MultiEdit | BashCommand | NotebookEdit
+FileOperation = Read | Write | Edit | BashCommand | NotebookEdit
+
+
+def list_session_files(project_dir: Path) -> list[Path]:
+    """List *.jsonl files in a Claude project directory, sorted oldest first."""
+    return sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+
+
+def file_path_of(op: FileOperation) -> str | None:
+    """Extract the file path from a FileOperation, or None for BashCommand."""
+    if isinstance(op, (Read, Write, Edit)):
+        return op.file_path
+    if isinstance(op, NotebookEdit):
+        return op.notebook_path
+    return None
 
 
 # =============================================================================
@@ -463,9 +477,10 @@ def make_file_operation(
     elif name == "Write":
         return Write(
             file_path=inp.get("file_path", ""),
-            content=inp.get("content", ""),
+            content=inp.get("content", "") if not is_error else "",
             timestamp=timestamp,
             tool_use_id=tool_use.id,
+            is_error=is_error,
         )
     
     elif name == "Edit":
@@ -476,19 +491,6 @@ def make_file_operation(
             timestamp=timestamp,
             tool_use_id=tool_use.id,
             replace_all=inp.get("replace_all", False),
-        )
-    
-    elif name == "MultiEdit":
-        edits = []
-        for edit in inp.get("edits", []):
-            old = edit.get("old_str", edit.get("old_string", ""))
-            new = edit.get("new_str", edit.get("new_string", ""))
-            edits.append((old, new))
-        return MultiEdit(
-            file_path=inp.get("file_path", ""),
-            edits=edits,
-            timestamp=timestamp,
-            tool_use_id=tool_use.id,
         )
     
     elif name == "Bash":
@@ -517,20 +519,20 @@ def make_file_operation(
 # CONVENIENCE PARSER
 # =============================================================================
 
-def parse_session(jsonl_path: str) -> list[FileOperation]:
+def parse_entries(jsonl_path: str) -> list[Entry]:
     """
-    Parse a Claude Code session JSONL file and extract all file operations.
-    
+    Parse a Claude Code session JSONL file into Entry objects.
+
+    Skips blank lines, malformed JSON, and progress entries (bloated sub-agent snapshots).
+
     Args:
         jsonl_path: Path to the session .jsonl file
-        
+
     Returns:
-        List of FileOperation instances in chronological order
+        List of Entry instances in file order
     """
-    import json
-    
     entries: list[Entry] = []
-    
+
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -540,21 +542,34 @@ def parse_session(jsonl_path: str) -> list[FileOperation]:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            
-            # Skip progress entries - they're bloated sub-agent snapshots
+
             if data.get("type") == "progress":
                 continue
-            
+
             entries.append(Entry.from_dict(data))
-    
+
+    return entries
+
+
+def extract_operations(jsonl_path: str) -> list[FileOperation]:
+    """
+    Parse a Claude Code session JSONL file and extract all file operations.
+
+    Args:
+        jsonl_path: Path to the session .jsonl file
+
+    Returns:
+        List of FileOperation instances in chronological order
+    """
+    entries = parse_entries(jsonl_path)
+
     # Build tool_use_id -> (result_content, is_error) mapping
     results: dict[str, tuple[str, bool]] = {}
     for entry in entries:
         if entry.type == "user" and entry.message:
             for block in entry.message.content:
                 if isinstance(block, ToolResultBlock):
-                    content = block.content if isinstance(block.content, str) else str(block.content)
-                    results[block.tool_use_id] = (content, block.is_error)
+                    results[block.tool_use_id] = (block.content, block.is_error)
 
     # Extract file operations from assistant messages
     operations: list[FileOperation] = []
@@ -576,73 +591,28 @@ def parse_session(jsonl_path: str) -> list[FileOperation]:
 def get_file_history(operations: list[FileOperation], file_path: str) -> list[FileOperation]:
     """
     Filter operations for a specific file path.
-    
+
     Args:
         operations: List of all file operations
         file_path: The file path to filter for
-        
+
     Returns:
         Operations affecting the specified file, in chronological order
     """
     result = []
     for op in operations:
-        if isinstance(op, (Read, Write, Edit, NotebookEdit)):
-            if op.file_path == file_path:
-                result.append(op)
-        elif isinstance(op, MultiEdit):
-            if op.file_path == file_path:
-                result.append(op)
-        elif isinstance(op, BashCommand):
-            # Check if command references the file
-            if file_path in op.command:
-                result.append(op)
+        op_path = file_path_of(op)
+        if op_path == file_path:
+            result.append(op)
+        elif isinstance(op, BashCommand) and _bash_references_path(op.command, file_path):
+            result.append(op)
     return result
 
 
-def reconstruct_file(operations: list[FileOperation], file_path: str) -> str | None:
-    """
-    Reconstruct a file's content by replaying operations.
-    
-    Finds the last Write or Read (as baseline), then applies subsequent Edits.
-    
-    Args:
-        operations: List of file operations (should be pre-filtered and sorted)
-        file_path: The file to reconstruct
-        
-    Returns:
-        Reconstructed file content, or None if no baseline found
-    """
-    # Get operations for this file
-    file_ops = get_file_history(operations, file_path)
-    if not file_ops:
-        return None
-    
-    # Find baseline (last Write, or last Read if no Write)
-    content: str | None = None
-    baseline_idx = -1
-    
-    for i, op in enumerate(file_ops):
-        if isinstance(op, Write):
-            content = op.content
-            baseline_idx = i
-        elif isinstance(op, Read) and content is None:
-            content = op.content
-            baseline_idx = i
-    
-    if content is None:
-        return None
-    
-    # Apply edits after baseline
-    for op in file_ops[baseline_idx + 1:]:
-        if isinstance(op, Edit):
-            if op.old_string in content:
-                content = content.replace(op.old_string, op.new_string, 1)
-        elif isinstance(op, MultiEdit):
-            for old_str, new_str in op.edits:
-                if old_str in content:
-                    content = content.replace(old_str, new_str, 1)
-        elif isinstance(op, Write):
-            # A later Write replaces everything
-            content = op.content
-    
-    return content
+def _bash_references_path(command: str, file_path: str) -> bool:
+    """Check if a bash command references a file path as an argument token."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return any(token == file_path or token.startswith(file_path + "/") for token in tokens)

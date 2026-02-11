@@ -2,13 +2,13 @@
 """Extract file operations from Claude session logs."""
 
 import json
-from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from .models import (
-    Read, Write, Edit, MultiEdit, BashCommand, NotebookEdit,
-    FileOperation, parse_session,
+    Read, Write, Edit, BashCommand, NotebookEdit,
+    FileOperation, file_path_of, list_session_files, extract_operations,
 )
 
 
@@ -19,14 +19,13 @@ class ExtractionStats:
     edits: int = 0
     full_reads: int = 0
     partial_reads: int = 0
-    multiedits: int = 0
     notebook_edits: int = 0
     errors: int = 0
-    files: set = field(default_factory=set)
+    files: set[str] = field(default_factory=set)
 
     @property
     def total(self) -> int:
-        return self.writes + self.edits + self.full_reads + self.partial_reads + self.multiedits + self.notebook_edits
+        return self.writes + self.edits + self.full_reads + self.partial_reads + self.notebook_edits
 
     def print_summary(self) -> None:
         """Print extraction summary."""
@@ -38,8 +37,6 @@ class ExtractionStats:
         print(f"  Edits:          {self.edits}")
         print(f"  Full reads:     {self.full_reads}")
         print(f"  Partial reads:  {self.partial_reads}")
-        if self.multiedits:
-            print(f"  MultiEdits:     {self.multiedits}")
         if self.notebook_edits:
             print(f"  NotebookEdits:  {self.notebook_edits}")
         print(f"Unique files:     {len(self.files)}")
@@ -48,7 +45,7 @@ class ExtractionStats:
         print("=" * 50)
 
 
-def format_timestamp(dt) -> str:
+def format_timestamp(dt: datetime) -> str:
     """Convert datetime to compact format: YYYYMMDD-HHMMSSmmm"""
     return dt.strftime('%Y%m%d-%H%M%S') + f"{dt.microsecond // 1000:03d}"
 
@@ -67,17 +64,8 @@ def save_operation(
     stats: ExtractionStats,
 ) -> None:
     """Save a file operation to output directory."""
-    # Get file path from operation
-    if isinstance(op, (Read, Write, Edit)):
-        file_path = op.file_path
-    elif isinstance(op, NotebookEdit):
-        file_path = op.notebook_path
-    elif isinstance(op, MultiEdit):
-        file_path = op.file_path
-    elif isinstance(op, BashCommand):
-        # Skip bash commands - they don't have a single file path
-        return
-    else:
+    file_path = file_path_of(op)
+    if file_path is None:
         return
 
     # Filter to project files only
@@ -90,6 +78,9 @@ def save_operation(
 
     # Determine operation type and content
     if isinstance(op, Write):
+        if op.is_error:
+            stats.errors += 1
+            return  # Skip failed writes
         op_name = "write"
         content = op.content
         suffix = ""
@@ -119,13 +110,6 @@ def save_operation(
         content = json.dumps(edit_data, indent=2)
         suffix = ""
         stats.edits += 1
-    elif isinstance(op, MultiEdit):
-        op_name = "multiedit"
-        content = json.dumps({
-            'edits': [{'old_string': old, 'new_string': new} for old, new in op.edits]
-        }, indent=2)
-        suffix = ""
-        stats.multiedits += 1
     elif isinstance(op, NotebookEdit):
         op_name = "notebook"
         content = json.dumps({
@@ -161,16 +145,18 @@ def extract_project(
     Returns:
         ExtractionStats with counts and file list
     """
+    if not project_root.endswith("/"):
+        project_root += "/"
     output_dir.mkdir(parents=True, exist_ok=True)
     stats = ExtractionStats()
 
     # Get all jsonl files sorted by modification time
-    jsonl_files = sorted(claude_project_dir.glob('*.jsonl'), key=lambda p: p.stat().st_mtime)
+    jsonl_files = list_session_files(claude_project_dir)
     print(f"Found {len(jsonl_files)} session files")
 
     for jsonl_path in jsonl_files:
         print(f"\nProcessing: {jsonl_path.name}")
-        operations = parse_session(str(jsonl_path))
+        operations = extract_operations(str(jsonl_path))
         for op in operations:
             save_operation(op, output_dir, project_root, stats)
 
